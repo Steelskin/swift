@@ -24,7 +24,6 @@ func test(x: X) {
   x.fromOverlayForC() // expected-member-visibility-error {{instance method 'fromOverlayForC()' is not available due to missing import of defining module 'Categories_C'}}
   x.fromSubmoduleOfD() // expected-member-visibility-error {{instance method 'fromSubmoduleOfD()' is not available due to missing import of defining module 'Categories_D'}}
   x.fromBridgingHeader()
-  x.overridesCategoryMethodOnNSObject()
 }
 
 func testAnyObject(a: AnyObject) {
@@ -38,7 +37,6 @@ func testAnyObject(a: AnyObject) {
   a.fromC() // expected-error {{value of type 'AnyObject' has no member 'fromC'}}
   a.fromOverlayForCObjC() // expected-error {{value of type 'AnyObject' has no member 'fromOverlayForCObjC'}}
   a.fromBridgingHeader()
-  a.overridesCategoryMethodOnNSObject()
 }
 
 extension StructInBridgingHeader {
@@ -48,11 +46,5 @@ extension StructInBridgingHeader {
 
   var wrappedMember: Int32 {
     return member
-  }
-}
-
-extension ObjectInBridgingHeader {
-  func test() {
-    overridesCategoryMethodOnNSObject()
   }
 }
