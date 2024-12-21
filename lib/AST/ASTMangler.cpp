@@ -427,7 +427,7 @@ std::string ASTMangler::mangleGlobalInit(const PatternBindingDecl *pd,
                                          unsigned pbdEntry,
                                          bool isInitFunc) {
   beginMangling();
-  
+
   Pattern *pattern = pd->getPattern(pbdEntry);
   bool first = true;
   pattern->forEachVariable([&](VarDecl *D) {
@@ -440,13 +440,13 @@ std::string ASTMangler::mangleGlobalInit(const PatternBindingDecl *pd,
     appendListSeparator();
   });
   assert(!first && "no variables in pattern binding?!");
-  
+
   if (isInitFunc) {
     appendOperator("WZ");
   } else {
     appendOperator("Wz");
   }
-  
+
   return finalize();
 }
 
@@ -474,7 +474,7 @@ std::string ASTMangler::mangleReabstractionThunkHelper(
     appendOperator("Ty");
   else
     appendOperator("TR");
-  
+
   if (GlobalActorBound) {
     appendType(GlobalActorBound, GenSig);
     appendOperator("TU");
@@ -1304,7 +1304,7 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
       appendType(bfa->getElementType(), sig, forDecl);
       return appendOperator("BV");
     }
-    
+
     case TypeKind::SILToken:
       return appendOperator("Bt");
     case TypeKind::BuiltinVector:
@@ -1596,7 +1596,7 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
       return appendOpaqueTypeArchetype(
           opaqueType, opaqueDecl, opaqueType->getSubstitutions(), sig, forDecl);
     }
-      
+
     case TypeKind::DynamicSelf: {
       auto dynamicSelf = cast<DynamicSelfType>(tybase);
       if (dynamicSelf->getSelfType()->getAnyNominal()) {
@@ -1654,13 +1654,13 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
       addTypeSubstitution(DepTy, sig);
       return;
     }
-      
+
     case TypeKind::Function:
       appendFunctionType(cast<FunctionType>(tybase), sig,
                          /*autoclosure*/ false,
                          forDecl);
       return;
-      
+
     case TypeKind::SILBox: {
       auto box = cast<SILBoxType>(tybase);
       auto layout = box->getLayout();
@@ -2110,7 +2110,7 @@ void ASTMangler::appendImplFunctionType(SILFunctionType *fn,
   if (fn->getInvocationSubstitutions()) {
     OpArgs.push_back('I');
   }
-  
+
   if (fn->isPolymorphic() && fn->isPseudogeneric())
     OpArgs.push_back('P');
 
@@ -2217,7 +2217,7 @@ void ASTMangler::appendImplFunctionType(SILFunctionType *fn,
   }
 
   GenericSignature sig = fn->getSubstGenericSignature();
-  
+
   // Mangle the parameters.
   for (auto param : fn->getParameters()) {
     OpArgs.push_back(getParamConvention(param.getConvention()));
@@ -2507,7 +2507,7 @@ void ASTMangler::appendContext(const DeclContext *ctx,
     if (auto ctor = dyn_cast<ConstructorDecl>(fn)) {
       return appendConstructorEntity(ctor, /*allocating*/ false);
     }
-    
+
     if (auto dtor = dyn_cast<DestructorDecl>(fn))
       return appendDestructorEntity(dtor, DestructorKind::NonDeallocating);
 
@@ -2523,7 +2523,7 @@ void ASTMangler::appendContext(const DeclContext *ctx,
     auto sd = cast<SubscriptDecl>(ctx);
     return appendEntity(sd);
   }
-      
+
   case DeclContextKind::Initializer: {
     switch (cast<Initializer>(ctx)->getInitializerKind()) {
     case InitializerKind::DefaultArgument: {
@@ -2591,15 +2591,9 @@ void ASTMangler::appendModule(const ModuleDecl *module,
   StringRef ModName = module->getRealName().str();
 
   // If RespectOriginallyDefinedIn is not set, ignore the ABI name only for
-  // _Concurrency and swift-syntax (which adds "Compiler" as a prefix when
-  // building swift-syntax as part of the compiler).
-  // TODO: Mangling for the debugger should respect originally defined in, but
-  // as of right now there is not enough information in the mangled name to
-  // reconstruct AST types from mangled names when using that attribute.
+  // _Concurrency.
   if ((RespectOriginallyDefinedIn ||
-       (module->getName().str() != SWIFT_CONCURRENCY_NAME &&
-        !module->getABIName().str().starts_with(
-            SWIFT_MODULE_ABI_NAME_PREFIX))) &&
+       module->getName().str() != SWIFT_CONCURRENCY_NAME) &&
       module->getABIName() != module->getName())
     ModName = module->getABIName().str();
 
@@ -2647,7 +2641,7 @@ void ASTMangler::appendProtocolName(const ProtocolDecl *protocol,
     // Try to use a symbolic reference substitution.
     if (tryMangleSubstitution(protocol))
       return;
-  
+
     appendSymbolicReference(protocol);
     // Substitutions can refer back to the symbolic reference.
     addSubstitution(protocol);
@@ -2906,7 +2900,7 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl,
     if (tryMangleSubstitution(cast<TypeAliasDecl>(decl)))
       return;
   }
-  
+
   // Try to mangle a symbolic reference for a nominal type.
   if (nominal && canSymbolicReference(nominal)) {
     appendSymbolicReference(nominal);
@@ -2940,7 +2934,7 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl,
     // Mangle ObjC classes using their runtime names.
     auto interface = dyn_cast<clang::ObjCInterfaceDecl>(namedDecl);
     auto protocol = dyn_cast<clang::ObjCProtocolDecl>(namedDecl);
-    
+
     if (UseObjCRuntimeNames && interface) {
       appendIdentifier(interface->getObjCRuntimeNameAsString());
     } else if (UseObjCRuntimeNames && protocol) {
@@ -3192,7 +3186,7 @@ getDefaultOwnership(const ValueDecl *forDecl) {
   if (!forFuncDecl) {
     return ParamSpecifier::Borrowing;
   }
-  
+
   if (isa<ConstructorDecl>(forFuncDecl)) {
     return ParamSpecifier::Consuming;
   } else if (auto accessor = dyn_cast<AccessorDecl>(forFuncDecl)) {
@@ -3204,7 +3198,7 @@ getDefaultOwnership(const ValueDecl *forDecl) {
       return ParamSpecifier::Borrowing;
     }
   }
-  
+
   return ParamSpecifier::Borrowing;
 }
 
@@ -3254,7 +3248,7 @@ void ASTMangler::appendFunctionInputType(
     AnyFunctionType *fnType, ArrayRef<AnyFunctionType::Param> params,
     GenericSignature sig, const ValueDecl *forDecl, bool isRecursedInto) {
   auto defaultSpecifier = getDefaultOwnership(forDecl);
-  
+
   switch (params.size()) {
   case 0:
     appendOperator("y");
@@ -3704,7 +3698,7 @@ void ASTMangler::appendGenericSignatureParts(
   // Mangle the number of parameters.
   unsigned depth = 0;
   unsigned count = 0;
-  
+
   // Since it's unlikely (but not impossible) to have zero generic parameters
   // at a depth, encode indexes starting from 1, and use a special mangling
   // for zero.
@@ -3716,7 +3710,7 @@ void ASTMangler::appendGenericSignatureParts(
     else
       OpBuffer << Index(count - 1);
   };
-  
+
   // As a special case, mangle nothing if there's a single generic parameter
   // at the initial depth.
   for (auto param : params) {
@@ -3966,7 +3960,7 @@ void ASTMangler::appendDeclType(const ValueDecl *decl,
   } else {
     appendType(type, sig, decl);
   }
-  
+
   // Mangle the generic signature, if any.
   if (genericSig
       && appendGenericSignature(genericSig, parentGenericSig, base)) {
@@ -4069,7 +4063,7 @@ void ASTMangler::appendEntity(const ValueDecl *decl,
 void ASTMangler::appendEntity(const ValueDecl *decl) {
   assert(!isa<ConstructorDecl>(decl));
   assert(!isa<DestructorDecl>(decl));
-  
+
   // Handle accessors specially, they are mangled as modifiers on the accessed
   // declaration.
   if (auto accessor = dyn_cast<AccessorDecl>(decl)) {
@@ -4616,7 +4610,7 @@ void ASTMangler::appendMacroExpansionContext(
   case GeneratedSourceInfo::AttributeFromClang:
     return appendMacroExpansionLoc();
   }
-  
+
   switch (generatedSourceInfo->kind) {
   // Freestanding macros
 #define FREESTANDING_MACRO_ROLE(Name, Description) \
