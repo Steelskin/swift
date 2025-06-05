@@ -106,6 +106,11 @@ The toolchain variant to build. Defaults to `Asserts`.
 .PARAMETER FoundationTestConfiguration
 Whether to run swift-foundation and swift-corelibs-foundation tests in a debug or release configuration.
 
+.PARAMETER HackUpdateBootstrapModuleMaps
+When set, updates the bootstrap toolchain module maps to use the latest version. This is only meant
+to be used for local development with more recent Windows SDKs than the ones supported by the
+bootstrap toolchain.
+
 .EXAMPLE
 PS> .\Build.ps1
 
@@ -158,7 +163,8 @@ param
   [ValidateSet("debug", "release")]
   [string] $FoundationTestConfiguration = "debug",
   [switch] $Summary,
-  [switch] $ToBatch
+  [switch] $ToBatch,
+  [switch] $HackUpdateBootstrapModuleMaps = $false
 )
 
 ## Prepare the build environment.
@@ -1012,6 +1018,27 @@ function Get-Dependencies {
     }
   }
 
+  # Update the boostrap toolchain module maps, if requested.
+  function Update-BootstrapModuleMaps {
+    param
+    (
+        [string]$BinaryCache
+    )
+
+    if (-not $HackUpdateBootstrapModuleMaps) {
+      return
+    }
+
+    Write-Output "[HACK] Overriding bootstrap module maps..."
+
+    $ModuleMapFolder = "$BinaryCache\toolchains\$PinnedToolchain\LocalApp\Programs\Swift\Platforms\$(Get-PinnedToolchainVersion)\Windows.platform\Developer\SDKs\Windows.sdk\usr\share"
+    $SwiftModuleMapFolder = "$SourceCache\swift\stdlib\public\Platform"
+    Copy-Item -Path "$SwiftModuleMapFolder\ucrt.modulemap" -Destination "$ModuleMapFolder\ucrt.modulemap"
+    Copy-Item -Path "$SwiftModuleMapFolder\vcruntime.apinotes" -Destination "$ModuleMapFolder\vcruntime.apinotes"
+    Copy-Item -Path "$SwiftModuleMapFolder\vcruntime.modulemap" -Destination "$ModuleMapFolder\vcruntime.modulemap"
+    Copy-Item -Path "$SwiftModuleMapFolder\winsdk.modulemap" -Destination "$ModuleMapFolder\winsdk.modulemap"
+  }
+
   if ($SkipBuild -and $SkipPackaging) { return }
 
   $Stopwatch = [Diagnostics.Stopwatch]::StartNew()
@@ -1043,6 +1070,7 @@ function Get-Dependencies {
   # TODO(compnerd) stamp/validate that we need to re-extract
   New-Item -ItemType Directory -ErrorAction Ignore $BinaryCache\toolchains | Out-Null
   Export-Toolchain "$PinnedToolchain.exe" $BinaryCache $PinnedToolchain
+  Update-BootstrapModuleMaps $BinaryCache
 
   function Get-KnownPython([string] $ArchName) {
     if (-not $KnownPythons.ContainsKey($PythonVersion)) {
