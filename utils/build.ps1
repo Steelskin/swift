@@ -1260,7 +1260,7 @@ function Build-CMakeProject {
     [hashtable] $Platform,
     [string] $Generator = "Ninja",
     [string] $CacheScript = "",
-    [ValidateSet("C", "CXX")]
+    [ValidateSet("ASM_MASM", "C", "CXX")]
     [string[]] $UseMSVCCompilers = @(),
     [ValidateSet("ASM", "C", "CXX", "Swift")]
     [string[]] $UseBuiltCompilers = @(),
@@ -1296,7 +1296,8 @@ function Build-CMakeProject {
       $env:NDKPATH = Get-AndroidNDKPath
     }
 
-    $UseASM = $UseBuiltCompilers.Contains("ASM") -or $UseMSVCCompilers.Contains("ASM") -or $UsePinnedCompilers.Contains("ASM")
+    $UseASM = $UseBuiltCompilers.Contains("ASM") -or $UsePinnedCompilers.Contains("ASM")
+    $UseASM_MASM = $UseMSVCCompilers.Contains("ASM_MASM")
     $UseC = $UseBuiltCompilers.Contains("C") -or $UseMSVCCompilers.Contains("C") -or $UsePinnedCompilers.Contains("C")
     $UseCXX = $UseBuiltCompilers.Contains("CXX") -or $UseMSVCCompilers.Contains("CXX") -or $UsePinnedCompilers.Contains("CXX")
     $UseSwift = $UseBuiltCompilers.Contains("Swift") -or $UsePinnedCompilers.Contains("Swift")
@@ -1319,22 +1320,27 @@ function Build-CMakeProject {
     switch ($Platform.OS) {
       Windows {
         if ($UseASM) {
-          # FIXME(compnerd) we should use `ml.exe` or `ml64.exe` based upon the host.
-          $ASM = if ($UseMSVCCompilers.Contains("ASM")) {
-            ""
-          } else {
-            Add-KeyValueIfNew $defines CMAKE_ASM_FLAGS @("--target=$($Platform.Triple)")
-
-            $Driver = $(if ($UseGNUDriver) { "clang.exe" } else { "clang-cl.exe" })
-            if ($UseBuiltCompilers.Contains("ASM")) {
-              [IO.Path]::Combine((Get-ProjectBinaryCache $BuildPlatform Compilers), "bin", $Driver)
-            } elseif ($UsePinnedCompilers.Contains("ASM")) {
-              Join-Path -Path (Get-PinnedToolchainToolsDir) -ChildPath $Driver
-            }
+          $Driver = $(if ($UseGNUDriver) { "clang.exe" } else { "clang-cl.exe" })
+          $ASM = if ($UseBuiltCompilers.Contains("ASM")) {
+            [IO.Path]::Combine((Get-ProjectBinaryCache $BuildPlatform Compilers), "bin", $Driver)
+          } elseif ($UsePinnedCompilers.Contains("ASM")) {
+            Join-Path -Path (Get-PinnedToolchainToolsDir) -ChildPath $Driver
           }
 
           Add-KeyValueIfNew $Defines CMAKE_ASM_COMPILER $ASM
+          Add-KeyValueIfNew $Defines CMAKE_ASM_FLAGS @("--target=$($Platform.Triple)")
           Add-KeyValueIfNew $Defines CMAKE_ASM_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL "/MD"
+        }
+
+        if ($UseASM_MASM) {
+          $ASM_MASM = if ($Platform.Architecture.VSName -eq "x86") {
+            "ml.exe"
+          } else {
+            "ml64.exe"
+          }
+
+          Add-KeyValueIfNew $Defines CMAKE_ASM_MASM_COMPILER $ASM_MASM
+          Add-KeyValueIfNew $Defines CMAKE_ASM_MASM_FLAGS @("/nologo" ,"/quiet")
         }
 
         if ($UseC) {
@@ -1355,16 +1361,21 @@ function Build-CMakeProject {
           $CFLAGS = if ($UseGNUDriver) {
             # TODO(compnerd) we should consider enabling stack protector usage for standard libraries.
             @("-fno-stack-protector", "-ffunction-sections", "-fdata-sections", "-fomit-frame-pointer")
+          } elseif ($UseMSVCCompilers.Contains("C")) {
+            @("/GS-", "/Gw", "/Gy", "/Oy", "/Oi", "/Zc:preprocessor", "/Zc:inline")
           } else {
-            @("/GS-", "/Gw", "/Gy", "/Oy", "/Oi", "/Zc:preprocessor")
+            # clang-cl does not support the /Zc:preprocessor flag.
+            @("/GS-", "/Gw", "/Gy", "/Oy", "/Oi", "/Zc:inline")
           }
 
           if ($DebugInfo) {
-            if ($CDebugFormat -eq "dwarf") {
-              $CFLAGS += if ($UseGNUDriver) {
-                @("-gdwarf")
-              } else {
-                @("-clang:-gdwarf")
+            if ($UsePinnedCompilers.Contains("C") -or $UseBuiltCompilers.Contains("C")) {
+              if ($CDebugFormat -eq "dwarf") {
+                $CFLAGS += if ($UseGNUDriver) {
+                  @("-gdwarf")
+                } else {
+                  @("-clang:-gdwarf")
+                }
               }
             }
           }
@@ -1390,15 +1401,22 @@ function Build-CMakeProject {
           $CXXFLAGS = if ($UseGNUDriver) {
             # TODO(compnerd) we should consider enabling stack protector usage for standard libraries.
             @("-fno-stack-protector", "-ffunction-sections", "-fdata-sections", "-fomit-frame-pointer")
-          } else {
+          } elseif ($UseMSVCCompilers.Contains("CXX")) {
             @("/GS-", "/Gw", "/Gy", "/Oy", "/Oi", "/Zc:preprocessor", "/Zc:inline", "/Zc:__cplusplus")
+          } else {
+            # clang-cl does not support the /Zc:preprocessor flag.
+            @("/GS-", "/Gw", "/Gy", "/Oy", "/Oi", "/Zc:inline", "/Zc:__cplusplus")
           }
 
           if ($DebugInfo) {
-            if ($CDebugInfo -eq "dwarf") {
-              $CXXFLAGS += @("-gdwarf")
-            } else {
-              $CXXFLAGS += @("-clang:-gdwarf")
+            if ($UsePinnedCompilers.Contains("CXX") -or $UseBuiltCompilers.Contains("CXX")) {
+              if ($CDebugFormat -eq "dwarf") {
+                $CXXFLAGS += if ($UseGNUDriver) {
+                  @("-gdwarf")
+                } else {
+                  @("-clang:-gdwarf")
+                }
+              }
             }
           }
 
@@ -1406,6 +1424,10 @@ function Build-CMakeProject {
         }
 
         if ($UseSwift) {
+          if ($UseBuiltCompilers.Contains("Swift")) {
+            Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER_WORKS "YES"
+          }
+
           $SWIFTC = if ($UseBuiltCompilers.Contains("Swift")) {
             [IO.Path]::Combine((Get-ProjectBinaryCache $BuildPlatform Compilers), "bin", "swiftc.exe")
           } elseif ($UsePinnedCompilers.Contains("Swift")) {
@@ -1440,14 +1462,14 @@ function Build-CMakeProject {
             )
           }
 
-          if ($DebugInfo) {
-            $SwiftFlags += if ($SwiftDebugFormat -eq "dwarf") {
+          $SwiftFlags += if ($DebugInfo) {
+            if ($SwiftDebugFormat -eq "dwarf") {
               @("-g", "-debug-info-format=dwarf", "-use-ld=lld-link", "-Xlinker", "/DEBUG:DWARF")
             } else {
               @("-g", "-debug-info-format=codeview", "-Xlinker", "/DEBUG")
             }
           } else {
-            $SwiftFlags += @("-gnone")
+            @("-gnone")
           }
 
           # Disable EnC as that introduces padding in the conformance tables
@@ -1464,8 +1486,12 @@ function Build-CMakeProject {
         if ($DebugInfo) {
           if ($UseASM -or $UseC -or $UseCXX) {
             # Prefer `/Z7` over `/ZI`
-            Add-FlagsDefine $Defines CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded
-            Add-FlagsDefine $Defines CMAKE_POLICY_DEFAULT_CMP0141 NEW
+            Add-KeyValueIfNew $Defines CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded
+            Add-KeyValueIfNew $Defines CMAKE_POLICY_DEFAULT_CMP0141 NEW
+            if ($UseASM) {
+              # The ASM compiler does not support `/Z7` so we use `/Zi` instead.
+              Add-FlagsDefine $Defines CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_Embedded "-Zi"
+            }
 
             if ($UseGNUDriver) {
               Add-FlagsDefine $Defines CMAKE_EXE_LINKER_FLAGS @("-Xlinker", "-debug")
@@ -1480,6 +1506,8 @@ function Build-CMakeProject {
 
       Android {
         $AndroidNDKPath = Get-AndroidNDKPath
+        $AndroidPrebuiltRoot = "$AndroidNDKPath\toolchains\llvm\prebuilt\$($BuildPlatform.OS.ToString().ToLowerInvariant())-$($BuildPlatform.Architecture.LLVMName)"
+        $AndroidSysroot = "$AndroidPrebuiltRoot\sysroot"
 
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_API "$AndroidAPILevel"
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_ARCH_ABI $Platform.Architecture.ABI
@@ -1489,33 +1517,55 @@ function Build-CMakeProject {
         }
 
         if ($UseC) {
-          Add-KeyValueIfNew $Defines CMAKE_C_COMPILER (Join-Path -Path $AndroidNDKPath -ChildPath "toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe")
+          $CC = if ($UseBuiltCompilers.Contains("C")) {
+            [IO.Path]::Combine((Get-ProjectBinaryCache $BuildPlatform Compilers), "bin", "clang.exe")
+          } else {
+            Join-Path -Path $AndroidPrebuiltRoot -ChildPath "bin\clang.exe"
+          }
+          Add-KeyValueIfNew $Defines CMAKE_C_COMPILER $CC
+          Add-KeyValueIfNew $Defines CMAKE_C_COMPILER_TARGET $Platform.Triple
           # FIXME(compnerd) why is this needed?
           Add-KeyValueIfNew $Defines CMAKE_C_COMPILER_WORKS YES
 
-          $CFLAGS = @("--sysroot=$(Get-AndroidNDKPath)\toolchains\llvm\prebuilt\$($BuildPlatform.OS.ToString().ToLowerInvariant())-$($BuildPlatform.Architecture.LLVMName)\sysroot")
+          $CFLAGS = @("--sysroot=${AndroidSysroot}")
+          if ($DebugInfo -and ($CDebugFormat -eq "dwarf")) {
+            $CFLAGS += @("-gdwarf")
+          }
           Add-FlagsDefine $Defines CMAKE_C_FLAGS $CFLAGS
         }
 
         if ($UseCXX) {
-          Add-KeyValueIfNew $Defines CMAKE_CXX_COMPILER (Join-Path -Path $androidNDKPath -ChildPath "toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe")
+          $CXX = if ($UseBuiltCompilers.Contains("CXX")) {
+            [IO.Path]::Combine((Get-ProjectBinaryCache $BuildPlatform Compilers), "bin", "clang++.exe")
+          } else {
+            Join-Path -Path $AndroidPrebuiltRoot -ChildPath "bin\clang++.exe"
+          }
+          Add-KeyValueIfNew $Defines CMAKE_CXX_COMPILER $CXX
+          Add-KeyValueIfNew $Defines CMAKE_CXX_COMPILER_TARGET $Platform.Triple
           # FIXME(compnerd) why is this needed?
           Add-KeyValueIfNew $Defines CMAKE_CXX_COMPILER_WORKS YES
 
-          $CXXFLAGS = @("--sysroot=$(Get-AndroidNDKPath)\toolchains\llvm\prebuilt\$($BuildPlatform.OS.ToString().ToLowerInvariant())-$($BuildPlatform.Architecture.LLVMName)\sysroot")
+          $CXXFLAGS = @("--sysroot=${AndroidSysroot}")
+          if ($DebugInfo -and ($CDebugFormat -eq "dwarf")) {
+            $CXXFLAGS += @("-gdwarf")
+          }
           Add-FlagsDefine $Defines CMAKE_CXX_FLAGS $CXXFLAGS
         }
 
         if ($UseSwift) {
+          if ($UseBuiltCompilers.Contains("Swift")) {
+            Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER_WORKS "YES"
+          }
+
           Add-KeyValueIfNew $Defines SWIFT_ANDROID_NDK_PATH "$AndroidNDKPath"
 
-          $swiftc = if ($UseBuiltCompilers.Contains("Swift")) {
+          $SWIFTC = if ($UseBuiltCompilers.Contains("Swift")) {
             [IO.Path]::Combine((Get-ProjectBinaryCache $BuildPlatform Compilers), "bin", "swiftc.exe")
           } else {
             Join-Path -Path (Get-PinnedToolchainToolsDir) -ChildPath  "swiftc.exe"
           }
+          Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER $SWIFTC
 
-          Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER $swiftc
           # TODO(compnerd) remove this once we bump to a newer pinned toolchain
           if ($UsePinnedCompilers.Contains("Swift")) {
             Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER_TARGET $Platform.Triple
@@ -1528,22 +1578,25 @@ function Build-CMakeProject {
           $SwiftFlags = if ($USePinnedCompilers.Contains("Swift")) {
             @("-sdk", (Get-PinnedToolchainSDK))
           } elseif ($SwiftSDK) {
-            @("-sdk", $SwiftSDK)
+            @(
+              "-sdk", $SwiftSDK,
+              "-sysroot", $AndroidSysroot
+            )
           } else {
             $RuntimeBinaryCache = Get-ProjectBinaryCache $Platform Runtime
             $SwiftResourceDir = "${RuntimeBinaryCache}\lib\swift"
 
             @(
-              "-sdk", "$AndroidNDKPath\toolchains\llvm\prebuilt\$($BuildPlatform.OS.ToString().ToLowerInvariant())-$($BuildPlatform.Architecture.LLVMName)\sysroot",
+              "-sdk", $AndroidSysroot,
               "-resource-dir", $SwiftResourceDir,
               "-L", "$SwiftResourceDir\$($Platform.OS.ToString().ToLowerInvariant())"
             )
           }
 
           $SwiftFlags += @(
-            "-Xclang-linekr", "-target", "-Xclang-linker", $Platform.Triple,
-            "-Xclang-linker", "--sysroot", "-Xclang-linker", "$AndroidNDKPath\toolchains\llvm\prebuilt\$($BuildPlatform.OS.ToString().ToLowerInvariant())-$($BuildPlatform.Architecture.LLVMName)\sysroot",
-            "-Xclang-linekr", "-resource-dir", "-Xclang-linker", "$AndroidNDKPath\toolchains\llvm\prebuilt\$($BuildPlatform.OS.ToString().ToLowerInvariant())-$($BuildPlatform.Architecture.LLVMName)\lib\clang\$($(Get-AndroidNDK).ClangVersion)"
+            "-Xclang-linker", "-target", "-Xclang-linker", $Platform.Triple,
+            "-Xclang-linker", "--sysroot", "-Xclang-linker", $AndroidSysroot,
+            "-Xclang-linker", "-resource-dir", "-Xclang-linker", "${AndroidPrebuiltRoot}\lib\clang\$($(Get-AndroidNDK).ClangVersion)"
           )
 
           $SwiftFlags += if ($DebugInfo) { @("-g") } else { @("-gnone") }
@@ -1797,7 +1850,7 @@ function Build-BuildTools([Hashtable] $Platform) {
     -Src $SourceCache\llvm-project\llvm `
     -Bin (Get-ProjectBinaryCache $Platform BuildTools) `
     -Platform $Platform `
-    -UseMSVCCompilers C,CXX `
+    -UseMSVCCompilers ASM_MASM,C,CXX `
     -BuildTargets llvm-tblgen,clang-tblgen,clang-pseudo-gen,clang-tidy-confusable-chars-gen,lldb-tblgen,llvm-config,swift-def-to-strings-converter,swift-serialize-diagnostics,swift-compatibility-symbols `
     -Defines @{
       CMAKE_CROSSCOMPILING = "NO";
