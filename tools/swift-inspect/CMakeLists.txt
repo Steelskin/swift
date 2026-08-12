@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.29)
 
 project(swift-inspect
   LANGUAGES C CXX Swift)
@@ -98,6 +98,11 @@ add_executable(swift-inspect
   Sources/swift-inspect/WinSDK+Extentions.swift)
 target_compile_options(swift-inspect PRIVATE
   -parse-as-library)
+# CMP0157 (CMake 3.29) passes the target name as the Swift module name, and a
+# hyphen is not a valid identifier.
+# TODO: Remove this once the minimum CMake version is 4.4, which sanitizes it.
+set_target_properties(swift-inspect PROPERTIES
+  Swift_MODULE_NAME swift_inspect)
 target_link_libraries(swift-inspect PRIVATE
   ArgumentParser
   swiftRemoteMirror)

@@ -1,5 +1,12 @@
 
 cmake_minimum_required(VERSION 3.26...3.29)
+
+if(POLICY CMP0157)
+  cmake_policy(SET CMP0157 NEW)
+endif()
+if(POLICY CMP0195)
+  cmake_policy(SET CMP0195 NEW)
+endif()
 # TODO before requiring CMake 4.1 or later
 # and/or enforcing CMP0195, please check/update
 # the implementation  of `emit_swift_interface`

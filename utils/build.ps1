@@ -598,6 +598,15 @@ $KnownCMakes = @{
       CMakeRoot = [IO.Path]::Combine("$ArtifactCache", "cmake-4.4.1-windows-arm64", "cmake-4.4.1-windows-arm64", "share", "cmake-4.4")
       Path = [IO.Path]::Combine("$ArtifactCache", "cmake-4.4.1-windows-arm64", "cmake-4.4.1-windows-arm64", "bin", "cmake.exe")
     };
+  };
+  # CMake built from source in S:\src\cmake.  A build-tree cmake.exe loads the
+  # source tree's `Modules` directly, so module edits need no rebuild.  No URL:
+  # nothing to download.  Select with `-CMakeVersion 4.5-dev`.
+  "4.5-dev" = @{
+    AMD64 = @{
+      CMakeRoot = "S:\src\cmake"
+      Path = "S:\src\cmake\build\bin\cmake.exe"
+    };
   }
 }
 
@@ -1828,8 +1837,10 @@ function Get-Dependencies {
 
     # Install CMake.
     $CMake = Get-CMake
-    DownloadAndVerify $CMake.URL "$ArtifactCache\$($CMake.FileName)" $CMake.SHA256
-    Expand-ArtifactZip $CMake.FileName $CMake.Artifact
+    if ($CMake.ContainsKey("URL")) {
+      DownloadAndVerify $CMake.URL "$ArtifactCache\$($CMake.FileName)" $CMake.SHA256
+      Expand-ArtifactZip $CMake.FileName $CMake.Artifact
+    }
     Write-Success "CMake $CMakeVersion"
 
     if ($Android) {
@@ -2133,6 +2144,16 @@ $Assemblers = @{
     }
     AssumeFunctional  = $true
   }
+
+  Stage1GNU = @{
+    Executable        = [IO.Path]::Combine((Get-ProjectToolchainBin $BuildPlatform Stage1Compilers), "clang.exe")
+    DriverStyle       = [DriverStyle]::GNU
+    Flags             = @()
+    DebugFlags        = { param([string] $Format)
+      if ($Format -eq "dwarf") { @("-gdwarf") } else { @("-gcodeview") }
+    }
+    AssumeFunctional  = $true
+  }
 }
 
 $Assemblers.Host = if ($UseHostToolchain) { $Assemblers.MSVC } else { $Assemblers.Pinned }
@@ -2331,18 +2352,26 @@ function Build-CMakeProject {
 
       Android {
         $AndroidNDKPath = Get-AndroidNDKPath
-        $AndroidPrebuiltRoot = "$AndroidNDKPath\toolchains\llvm\prebuilt\$($BuildPlatform.OS.ToString().ToLowerInvariant())-$($BuildPlatform.Architecture.LLVMName)"
-        $AndroidSysroot = "$AndroidPrebuiltRoot\sysroot"
 
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_API "$AndroidAPILevel"
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_ARCH_ABI $Platform.Architecture.ABI
         Add-KeyValueIfNew $Defines CMAKE_ANDROID_NDK "$AndroidNDKPath"
-        Add-KeyValueIfNew $Defines CMAKE_SYSROOT "$AndroidSysroot"
+
+        # Our clang does not carry an Android sysroot next to itself the way
+        # the NDK's clang does, so point it at the NDK's.  CMake passes this to
+        # every language, Swift included (`-sysroot`).  CMake's Android modules
+        # only recognise the path with forward slashes.
+        $AndroidSysroot = "$AndroidNDKPath/toolchains/llvm/prebuilt/windows-x86_64/sysroot" -replace '\\', '/'
+        Add-KeyValueIfNew $Defines CMAKE_SYSROOT $AndroidSysroot
 
         if ($UseASM) {
+          Add-KeyValueIfNew $Defines CMAKE_ASM_COMPILER $Assembler.Executable
+          Add-KeyValueIfNew $Defines CMAKE_ASM_COMPILER_TARGET $Platform.Triple
+          Add-FlagsDefine $Defines CMAKE_ASM_FLAGS $Assembler.Flags
         }
 
         if ($UseC) {
+          Add-KeyValueIfNew $Defines CMAKE_C_COMPILER $CCompiler.Executable
           Add-KeyValueIfNew $Defines CMAKE_C_COMPILER_TARGET $Platform.Triple
           Add-FlagsDefine $Defines CMAKE_C_FLAGS $CCompiler.Flags
           if ($DebugInfo) {
@@ -2351,6 +2380,7 @@ function Build-CMakeProject {
         }
 
         if ($UseCXX) {
+          Add-KeyValueIfNew $Defines CMAKE_CXX_COMPILER $CXXCompiler.Executable
           Add-KeyValueIfNew $Defines CMAKE_CXX_COMPILER_TARGET $Platform.Triple
           Add-FlagsDefine $Defines CMAKE_CXX_FLAGS $CXXCompiler.Flags
           if ($DebugInfo) {
@@ -2363,9 +2393,6 @@ function Build-CMakeProject {
             Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER_WORKS "YES"
           }
 
-          # FIXME(compnerd) remove this once the old runtimes build path is removed.
-          Add-KeyValueIfNew $Defines SWIFT_ANDROID_NDK_PATH "$AndroidNDKPath"
-
           Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER $SwiftCompiler.Executable
           Add-KeyValueIfNew $Defines CMAKE_Swift_COMPILER_TARGET $Platform.Triple
           # Skip compiler ID detection: avoids compiling+scanning a multi-MB test binary on every configure.
@@ -2373,69 +2400,12 @@ function Build-CMakeProject {
 
           Add-FlagsDefine $Defines CMAKE_Swift_FLAGS $SwiftCompiler.Flags
           if ($SwiftSDK) {
-            # TODO: CMake does not yet have support for passing `CMAKE_SYSROOT`
-            # to the Swift compiler yet.  Once we have that, we can drop
-            # `-sysroot $AndroidSysroot` here.
-            Add-FlagsDefine $Defines CMAKE_Swift_FLAGS @("-sdk", $SwiftSDK, "-sysroot", $AndroidSysroot)
+            Add-FlagsDefine $Defines CMAKE_Swift_FLAGS @("-sdk", $SwiftSDK)
           }
           if ($DebugInfo) {
             Add-FlagsDefine $Defines CMAKE_Swift_FLAGS $(& $SwiftCompiler.DebugFlags $PlatformDebugFormat)
           } else {
             Add-FlagsDefine $Defines CMAKE_Swift_FLAGS @("-gnone")
-          }
-
-          Add-FlagsDefine $Defines CMAKE_Swift_FLAGS @(
-            "-Xclang-linker", "-target", "-Xclang-linker", $Platform.Triple,
-            "-Xclang-linker", "--sysroot", "-Xclang-linker", $AndroidSysroot,
-            "-Xclang-linker", "-resource-dir", "-Xclang-linker", "${AndroidPrebuiltRoot}\lib\clang\$($(Get-AndroidNDK).ClangVersion)"
-          )
-        }
-
-        if (($UseASM -and $Assembler.AssumeFunctional) -or ($UseC -and $CCompiler.AssumeFunctional) -or ($UseCXX -and $CXXCompiler.AssumeFunctional)) {
-          # Use a built lld linker as the Android's NDK linker might be too old
-          # and not support all required relocations needed by the Swift
-          # runtime.
-          $Executable = if ($UseC) {
-            $CCompiler.Executable
-          } elseif ($UseCXX) {
-            $CXXCompiler.Executable
-          } elseif ($UseASM) {
-            (& $Assembler.Executable $Platform)
-          }
-          $ld = Join-Path -Path (Split-Path $Executable) -ChildPath "ld.lld"
-          if ($UseSwift) {
-            # The Android NDK injects `-Wl,<arg>` flags into
-            # `CMAKE_*_LINKER_FLAGS` via `CMAKE_*_LINKER_FLAGS_INIT` variables.
-            # CMake 3.30+ passes these to the Swift driver, which doesn't
-            # understand the `-Wl,` syntax. Pre-set the flags in a portable form
-            # (`-Xlinker <arg>`) from the command line as this takes precedence
-            # over the NDK's `*_INIT` mechanism.
-            #
-            # `--ld-path` and `-Qunused-arguments` are Clang driver flags,
-            # handled via `CMAKE_PROJECT_INCLUDE` with a `LINK_LANGUAGE` guard,
-            # so they do not affect Swift linking.
-            $AndroidLinkerFlags = @(
-              "-Xlinker", "--build-id=sha1",
-              "-Xlinker", "--no-rosegment",
-              "-Xlinker", "--no-undefined-version",
-              "-Xlinker", "--fatal-warnings",
-              "-Xlinker", "--gc-sections",
-              "-Xlinker", "--no-undefined"
-            )
-            Add-FlagsDefine $Defines CMAKE_SHARED_LINKER_FLAGS $AndroidLinkerFlags
-            Add-FlagsDefine $Defines CMAKE_EXE_LINKER_FLAGS ($AndroidLinkerFlags + @("-Xlinker", "--gc-sections"))
-            Add-FlagsDefine $Defines CMAKE_MODULE_LINKER_FLAGS $AndroidLinkerFlags
-            Add-KeyValueIfNew $Defines SWIFT_ANDROID_LD_PATH $ld
-            Add-KeyValueIfNew $Defines CMAKE_PROJECT_INCLUDE "$SourceCache\swift\utils\android-overrides.cmake"
-          } else {
-            # Clang Runtime explicitly sets linker flags for every target,
-            # making the `add_link_options()` approach via
-            # `CMAKE_PROJECT_INCLUDE` not viable. Since the problem that the
-            # above block aims to solve only concerns projects that use Swift,
-            # we can get away with just overriding `CMAKE_*_LINKER_FLAGS` for
-            # non-Swift projects.
-            Add-FlagsDefine $Defines CMAKE_SHARED_LINKER_FLAGS "--ld-path=$ld"
-            Add-FlagsDefine $Defines CMAKE_EXE_LINKER_FLAGS "--ld-path=$ld"
           }
         }
 
@@ -2465,16 +2435,6 @@ function Build-CMakeProject {
         "$($_.Key)=$($_.Value)"
       }) -join ";"
 
-      # Skip the clang-cache launcher when targeting Android: cmake auto-detects
-      # the NDK's clang (e.g. 19.x) as the actual compiler, but the launcher
-      # we'd point at lives under Stage1Compilers (a newer LLVM, e.g. 21.x).
-      # The version skew makes the in-process dep scanner look for builtin
-      # headers (`stddef.h`, `float.h`, ...) under the wrong resource-dir
-      # layout and fail with "CAS-based dependency scan failed: failed to get
-      # include-tree".  Compiler-rt builds for Android are fast enough without
-      # the launcher.
-      $LauncherSafe = ($Platform.OS -ne [OS]::Android)
-
       # The dependency scanner presents source inputs to Clang using the
       # synthetic paths from LLVM_CACHE_PREFIX_MAPS. This covers source paths
       # in debug info, coverage, and macros without putting a host-specific
@@ -2486,13 +2446,13 @@ function Build-CMakeProject {
         $ClangCachingFlags += "-gno-codeview-command-line"
       }
 
-      if ($LauncherSafe -and $UseC -and $CCompiler.DriverStyle -ne [DriverStyle]::CL) {
+      if ($UseC -and $CCompiler.DriverStyle -ne [DriverStyle]::CL) {
         Add-FlagsDefine $Defines CMAKE_C_FLAGS $ClangCachingFlags
         Add-KeyValueIfNew $Defines CMAKE_C_COMPILER_LAUNCHER `
             (Join-Path -Path (Split-Path $CCompiler.Executable) -ChildPath "clang-cache.exe")
       }
 
-      if ($LauncherSafe -and $UseCXX -and $CXXCompiler.DriverStyle -ne [DriverStyle]::CL) {
+      if ($UseCXX -and $CXXCompiler.DriverStyle -ne [DriverStyle]::CL) {
         Add-FlagsDefine $Defines CMAKE_CXX_FLAGS $ClangCachingFlags
         Add-KeyValueIfNew $Defines CMAKE_CXX_COMPILER_LAUNCHER `
             (Join-Path -Path (Split-Path $CXXCompiler.Executable) -ChildPath "clang-cache.exe")
@@ -3654,6 +3614,22 @@ function Build-CompilerRuntime([Hashtable] $Platform,
   $C   = if ($Platform.OS -eq [OS]::Windows) { $Compilers.C   } else { $Compilers.GNUC   }
   $CXX = if ($Platform.OS -eq [OS]::Windows) { $Compilers.CXX } else { $Compilers.GNUCXX }
 
+  $BuiltinsDefines = @{
+    LLVM_DIR = "$LLVMBinaryCache\lib\cmake\llvm";
+    LLVM_ENABLE_PER_TARGET_RUNTIME_DIR = "YES";
+    COMPILER_RT_DEFAULT_TARGET_ONLY = "YES";
+  }
+  if ($Platform.OS -eq [OS]::Android) {
+    $BuiltinsDefines += @{
+      # The NDK's builtins provide the generic `__atomic_*` entry points, which
+      # 32-bit ARM emits libcalls to and `libatomic` does not define.
+      COMPILER_RT_EXCLUDE_ATOMIC_BUILTIN = "NO";
+      # Do not require the NDK's builtins to be linked against while building
+      # the compiler builtins. This greatly simplifies the Android configuration.
+      CMAKE_TRY_COMPILE_TARGET_TYPE = "STATIC_LIBRARY";
+    }
+  }
+
   Build-CMakeProject `
     -Src $SourceCache\llvm-project\compiler-rt\lib\builtins `
     -Bin "$(Get-ProjectBinaryCache $Platform ClangBuiltins)" `
@@ -3663,11 +3639,42 @@ function Build-CompilerRuntime([Hashtable] $Platform,
     -CCompiler $C `
     -CXXCompiler $CXX `
     -BuildTargets "install-compiler-rt" `
-    -Defines @{
-      LLVM_DIR = "$LLVMBinaryCache\lib\cmake\llvm";
-      LLVM_ENABLE_PER_TARGET_RUNTIME_DIR = "YES";
-      COMPILER_RT_DEFAULT_TARGET_ONLY = "YES";
+    -Defines $BuiltinsDefines
+
+  if ($Platform.OS -eq [OS]::Android) {
+    # Install a second copy into the resource directory of the compiler that
+    # builds this SDK, so that it finds the builtins on its own rather than
+    # being pointed at the NDK's.
+    $ResourceDir = & $C.Executable -print-resource-dir
+    if (-not $ResourceDir) {
+      throw "could not determine the resource directory of $($C.Executable)"
     }
+    Invoke-Program (Get-CMake).Path `
+      --install "$(Get-ProjectBinaryCache $Platform ClangBuiltins)" `
+      --prefix $ResourceDir.Trim()
+  }
+
+  $RuntimeDefines = @{
+    LLVM_DIR = "$LLVMBinaryCache\lib\cmake\llvm";
+    LLVM_ENABLE_PER_TARGET_RUNTIME_DIR = "YES";
+    COMPILER_RT_DEFAULT_TARGET_ONLY = "YES";
+    COMPILER_RT_BUILD_BUILTINS = "NO";
+    COMPILER_RT_BUILD_CRT = "NO";
+    COMPILER_RT_BUILD_LIBFUZZER = "NO";
+    COMPILER_RT_BUILD_ORC = "NO";
+    COMPILER_RT_BUILD_XRAY = "NO";
+    COMPILER_RT_BUILD_PROFILE = "YES";
+    COMPILER_RT_BUILD_SANITIZERS = "YES";
+  }
+  if ($Platform.OS -eq [OS]::Android) {
+    $RuntimeDefines += @{
+      # The sanitizer runtimes are linked with `-nodefaultlibs` and leave their
+      # libc++abi, libunwind and builtins references undefined on purpose; they
+      # resolve at load time. The NDK's default `--no-undefined` is meant for
+      # application code, so opt out of it here.
+      ANDROID_ALLOW_UNDEFINED_SYMBOLS = "YES";
+    }
+  }
 
   Build-CMakeProject `
     -Src $SourceCache\llvm-project\compiler-rt `
@@ -3678,18 +3685,7 @@ function Build-CompilerRuntime([Hashtable] $Platform,
     -CCompiler $C `
     -CXXCompiler $CXX `
     -BuildTargets "install-compiler-rt" `
-    -Defines @{
-      LLVM_DIR = "$LLVMBinaryCache\lib\cmake\llvm";
-      LLVM_ENABLE_PER_TARGET_RUNTIME_DIR = "YES";
-      COMPILER_RT_DEFAULT_TARGET_ONLY = "YES";
-      COMPILER_RT_BUILD_BUILTINS = "NO";
-      COMPILER_RT_BUILD_CRT = "NO";
-      COMPILER_RT_BUILD_LIBFUZZER = "NO";
-      COMPILER_RT_BUILD_ORC = "NO";
-      COMPILER_RT_BUILD_XRAY = "NO";
-      COMPILER_RT_BUILD_PROFILE = "YES";
-      COMPILER_RT_BUILD_SANITIZERS = "YES";
-    }
+    -Defines $RuntimeDefines
 }
 
 function Build-Brotli([Hashtable] $Platform,
@@ -4272,7 +4268,7 @@ function Build-SDKDependencies([Hashtable[]] $ArchitectureSlices,
     Invoke-BuildStep Build-Brotli $Slice -CCompiler $C
     Invoke-BuildStep Build-XML2 $Slice -CCompiler $C -CXXCompiler $CXX -Phase ""
     if ($Slice.OS -ne [OS]::Windows) {
-      Invoke-BuildStep Build-BoringSSL $Slice -Assembler $Assemblers.Stage1 -CCompiler $C -CXXCompiler $CXX
+      Invoke-BuildStep Build-BoringSSL $Slice -Assembler $Assemblers.Stage1GNU -CCompiler $C -CXXCompiler $CXX
     }
     Invoke-BuildStep Build-CURL $Slice -CCompiler $C
   }
@@ -5962,7 +5958,9 @@ if ($Toolchain) {
 
   # ── Stage2 Compiler Runtimes ──────────────────────────────────────────────
   Get-SelectedSDKBuilds | ForEach-Object {
-    Invoke-BuildStep Build-CompilerRuntime $_ -Assembler $Assemblers.Stage1 -Compilers $Compilers.Stage1
+    Invoke-BuildStep Build-CompilerRuntime $_ `
+        -Assembler $(if ($_.OS -eq [OS]::Windows) { $Assemblers.Stage1 } else { $Assemblers.Stage1GNU }) `
+        -Compilers $Compilers.Stage1
   }
 
   # ── Stage2 Compiler Macros ────────────────────────────────────────────────

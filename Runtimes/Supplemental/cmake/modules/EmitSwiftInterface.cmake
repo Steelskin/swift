@@ -25,8 +25,19 @@ function(emit_swift_interface target)
     message(STATUS "Removing regular file ${CMAKE_CURRENT_BINARY_DIR}/${module_name}.swiftmodule to support nested swiftmodule generation")
     file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/${module_name}.swiftmodule")
   endif()
-  target_compile_options(${target} PRIVATE
-    "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-emit-module-path ${CMAKE_CURRENT_BINARY_DIR}/${module_name}.swiftmodule/${${PROJECT_NAME}_MODULE_TRIPLE}.swiftmodule>")
+  set(_cmp0195_status "OLD")
+  if(POLICY CMP0195)
+    cmake_policy(GET CMP0195 _cmp0195_status)
+  endif()
+  if(_cmp0195_status STREQUAL "NEW")
+    # Under CMP0195 CMake emits <module>.swiftmodule/<triple>.swiftmodule
+    # itself. Pin the module directory so it matches the layout used below.
+    set_target_properties(${target} PROPERTIES
+      Swift_MODULE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  else()
+    target_compile_options(${target} PRIVATE
+      "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-emit-module-path ${CMAKE_CURRENT_BINARY_DIR}/${module_name}.swiftmodule/${${PROJECT_NAME}_MODULE_TRIPLE}.swiftmodule>")
+  endif()
   if(${PROJECT_NAME}_VARIANT_MODULE_TRIPLE)
     target_compile_options(${target} PRIVATE
       "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-emit-variant-module-path ${CMAKE_CURRENT_BINARY_DIR}/${module_name}.swiftmodule/${${PROJECT_NAME}_VARIANT_MODULE_TRIPLE}.swiftmodule>")
