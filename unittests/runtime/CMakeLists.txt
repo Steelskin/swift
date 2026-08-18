@@ -135,6 +135,16 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
                                swiftCore_EXPORTS
                                SWIFT_INLINE_NAMESPACE=__runtime)
 
+  # The local stdlib stubs must match the accessors the runtime actually
+  # references, which depend on whether the stdlib is resilient.  Mirror the
+  # condition used for the stdlib itself in AddSwiftStdlib.cmake.
+  if(SWIFT_STDLIB_STABLE_ABI AND
+     NOT "${SWIFT_PRIMARY_VARIANT_SDK}" STREQUAL "LINUX_STATIC")
+    target_compile_definitions(SwiftRuntimeTests PRIVATE SWIFT_LIBRARY_EVOLUTION=1)
+  else()
+    target_compile_definitions(SwiftRuntimeTests PRIVATE SWIFT_LIBRARY_EVOLUTION=0)
+  endif()
+
   if(SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT)
     target_compile_definitions(SwiftRuntimeTests
                                PRIVATE SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT)

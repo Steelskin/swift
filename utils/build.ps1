@@ -2399,6 +2399,29 @@ function Build-CMakeProject {
   Write-Host ""
 }
 
+# Build targets in an already-configured build directory.
+#
+# Build-CMakeProject re-runs the configure step on every call.  The test phase
+# calls it several times with identical arguments, so every call after the first
+# only costs time and re-triggers per-configure churn (generated files that are
+# rewritten unconditionally, e.g. libxml2's rcVersion.h, dirty their dependents
+# again).  Ninja still regenerates build.ninja by itself if CMakeCache.txt or a
+# CMakeLists.txt actually changed, so nothing is lost by skipping the explicit
+# configure.
+function Invoke-CMakeBuildTargets([Hashtable] $Platform, [string] $Bin, [string[]] $Targets) {
+  if (-not $Targets) { return }
+  Invoke-IsolatingEnvVars {
+    if ($Platform.OS -eq [OS]::Windows) {
+      Invoke-VsDevShell $Platform
+    }
+    $env:CMAKE_ROOT = (Get-CMake).CMakeRoot
+    $CMakeBin = (Get-CMake).Path
+    foreach ($Target in $Targets) {
+      Invoke-Program $CMakeBin --build $Bin --target $Target
+    }
+  }
+}
+
 enum SPMBuildAction {
   # 'swift build'
   Build
@@ -2869,6 +2892,91 @@ function Write-ToolchainInfo([Hashtable] $Platform,
   Write-PList -Settings $Settings -Path "$ToolchainRoot\ToolchainInfo.plist"
 }
 
+# Diagnostic only: ask ninja why the requested targets are out of date, without
+# building anything.  Incremental test runs are supposed to be nearly clean, so
+# a long list here is a signal that something declares outputs it never produces
+# or has lost its dep-log entries.  Never fail the build over this.
+function Write-NinjaRebuildReasons([string] $BuildDir, [string[]] $Targets, [string] $Label) {
+  $ErrorActionPreference = "Continue"
+
+  if (-not (Test-Path (Join-Path $BuildDir "build.ninja"))) {
+    Write-Host "ninja explain [$Label]: no build.ninja in '$BuildDir' yet; skipping"
+    return
+  }
+  if (-not $Targets) {
+    Write-Host "ninja explain [$Label]: no targets requested; skipping"
+    return
+  }
+
+  Write-Host "ninja explain [$Label]: $($Targets -join ', ')"
+  try {
+    $Ninja = Get-Ninja
+    $Output = & $Ninja -C $BuildDir -n -d explain @Targets 2>&1 |
+      ForEach-Object { $_.ToString() }
+    $Explain = @($Output | Where-Object { $_ -match '^ninja explain:' })
+    if (-not $Explain) {
+      Write-Host "  nothing to rebuild"
+      return
+    }
+
+    $Kinds = [ordered]@{
+      "deps-missing"    = @($Explain | Where-Object { $_ -match 'deps for ' }).Count
+      "output-missing"  = @($Explain | Where-Object { $_ -match "doesn't exist" }).Count
+      "older-than-input"= @($Explain | Where-Object { $_ -match 'older than' }).Count
+      "command-changed" = @($Explain | Where-Object { $_ -match 'command line changed' }).Count
+      "dirty"           = @($Explain | Where-Object { $_ -match 'is dirty' }).Count
+    }
+    $Summary = ($Kinds.GetEnumerator() |
+      Where-Object { $_.Value -gt 0 } |
+      ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ", "
+    Write-Host "  $($Explain.Count) reason(s): $Summary"
+
+    # "command line changed" is the signature of the CMAKE_ASM_SIMULATE_ID
+    # re-detection bug (include separators flipping between configures).  It is
+    # supposed to be zero, and it is rare enough to always report in full --
+    # with the current command line, since ninja only records a hash of the
+    # previous one and cannot show what it was.
+    $CommandChanged = @($Explain | Where-Object { $_ -match 'command line changed' })
+    if ($CommandChanged) {
+      Write-Host "  --- command line changed ($($CommandChanged.Count)) ---"
+      foreach ($Line in $CommandChanged) {
+        Write-Host "    $Line"
+        if ($Line -match 'command line changed for (.+?)\s*$') {
+          $ChangedOutput = $Matches[1].Trim()
+          $Command = & $Ninja -C $BuildDir -t commands $ChangedOutput 2>&1 |
+            ForEach-Object { $_.ToString() } |
+            Where-Object { $_ -notmatch '^ninja:' } |
+            Select-Object -Last 1
+          if ($Command) {
+            $Command = $Command.Trim()
+            if ($Command.Length -gt 600) { $Command = $Command.Substring(0, 600) + " ..." }
+            Write-Host "      now: $Command"
+          }
+        }
+      }
+    }
+
+    # Sample the remaining categories rather than the head of one flat list, so
+    # a large category cannot hide a small one.
+    $PerKind = 6
+    foreach ($Kind in @(
+      @{ Name = "output-missing";   Match = "doesn't exist" },
+      @{ Name = "deps-missing";     Match = 'deps for ' },
+      @{ Name = "older-than-input"; Match = 'older than' },
+      @{ Name = "dirty";            Match = 'is dirty' })) {
+      $Lines = @($Explain | Where-Object { $_ -match $Kind.Match })
+      if (-not $Lines) { continue }
+      Write-Host "  --- $($Kind.Name) ($($Lines.Count)) ---"
+      $Lines | Select-Object -First $PerKind | ForEach-Object { Write-Host "    $_" }
+      if ($Lines.Count -gt $PerKind) {
+        Write-Host "    ... $($Lines.Count - $PerKind) more"
+      }
+    }
+  } catch {
+    Write-Warning "ninja explain [$Label]: failed ($($_.Exception.Message))"
+  }
+}
+
 function Get-WindowsSxSRuntimeDLLs([string] $RuntimeSourceDir) {
   $DeveloperDLLs = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
@@ -3172,6 +3280,49 @@ function Set-WindowsSxSToolchainRuntimePerDLL {
   Write-Host "Set-WindowsSxSToolchainRuntimePerDLL: bound $BoundEXECount EXE(s); skipped $SkippedCount EXE(s) with no runtime imports"
 }
 
+# Bind the test-time toolchain executables to a fixed Swift runtime.  Idempotent:
+# restages the private assembly and re-stamps every tool, so it is safe to run
+# both before and after the artifact build.
+function Invoke-TestToolchainSxSBind([Hashtable] $BuildPlatform,
+                                     [string] $Stage2BinDir,
+                                     [string] $LibexecSwiftDir,
+                                     [string] $RuntimeSource,
+                                     [string] $Phase) {
+  Invoke-IsolatingEnvVars {
+    # Test-time tools execute on the build host.
+    Invoke-VsDevShell $BuildPlatform
+    Write-Host "SxS bind [$Phase]:"
+    Set-WindowsSxSToolchainRuntime `
+      -BinaryDir              $Stage2BinDir `
+      -RuntimeSourceDir       $RuntimeSource `
+      -ProcessorArchitecture  $BuildPlatform.Architecture.VSName `
+      -Tools                  @(
+                                 "swift.exe",
+                                 "swiftc.exe",
+                                 "swift-driver.exe",
+                                 "swift-frontend.exe",
+                                 "swift-synthesize-interface.exe",
+                                 "sil-opt.exe",
+                                 "sourcekitd-test.exe",
+                                 "swift-ide-test.exe",
+                                 "swift-plugin-server.exe",
+                                 "swiftc-legacy-driver.exe",
+                                 "lldb.exe",
+                                 "repl_swift.exe"
+                               )
+    # SxS only probes the EXE's own directory for the named assembly.
+    if (Test-Path (Join-Path $LibexecSwiftDir "swift-backtrace.exe")) {
+      Set-WindowsSxSToolchainRuntime `
+        -BinaryDir              $LibexecSwiftDir `
+        -RuntimeSourceDir       $RuntimeSource `
+        -ProcessorArchitecture  $BuildPlatform.Architecture.VSName `
+        -Tools                  @("swift-backtrace.exe")
+    } else {
+      Write-Warning "SxS bind [$Phase]: '$LibexecSwiftDir\swift-backtrace.exe' not present; skipping backtracer bind (Build-TestBacktrace did not run or failed)"
+    }
+  }
+}
+
 function Test-Compilers([Hashtable] $Platform, [string] $Variant, [switch] $TestClang, [switch] $TestLLD, [switch] $TestLLDB, [switch] $TestLLDBSwift, [switch] $TestLLVM, [switch] $TestSwift) {
   Invoke-IsolatingEnvVars {
     $SwiftSDK = Get-SwiftSDK -OS $Platform.OS
@@ -3239,12 +3390,15 @@ function Test-Compilers([Hashtable] $Platform, [string] $Variant, [switch] $Test
       Write-Warning "Test-Compilers invoked without specifying test target(s)."
     }
 
-    # Build and bind the runtime-loading tools before swift-test-stdlib can
-    # repopulate bin\ with freshly-built runtime DLLs.  This path intentionally
-    # uses the bundle SxS helper rather than the per-DLL install-layout helper
-    # because the test build keeps producing flat runtime DLLs in bin\.  Reuse
-    # the same configure arguments for the final build so ninja does not relink
-    # away the manifests.
+    # Three phases: build every test artifact, bind the SxS manifests, then run
+    # the tests.  The bind must run after the artifacts exist -- lldb.exe and
+    # repl_swift.exe are produced only by the LLDB test dependency graph, so a
+    # bind scheduled before them skips them silently (see the "does not exist"
+    # warning in Set-WindowsSxSToolchainRuntime).  Every phase reuses the same
+    # configure arguments so ninja never relinks away a stamped manifest.  This
+    # path intentionally uses the bundle SxS helper rather than the per-DLL
+    # install-layout helper because the test build keeps producing flat runtime
+    # DLLs in bin\; the bundle assembly directory coexists with them.
     $BuildCMakeArgs = @{
       Src           = [IO.Path]::Combine($SourceCache, "llvm-project", "llvm")
       Bin           = (Get-ProjectBinaryCache $Platform Stage2Compilers)
@@ -3258,12 +3412,19 @@ function Test-Compilers([Hashtable] $Platform, [string] $Variant, [switch] $Test
       Defines       = $TestingDefines
     }
 
-    Build-CMakeProject @BuildCMakeArgs -BuildTargets @(
+    # Phase 1: the compiler tools that the bind stamps.  The bind (phase 2) has
+    # to run before swift-test-stdlib (phase 3) starts rewriting the flat runtime
+    # DLLs in bin\.  Unbound, swift-frontend loads a half-rewritten swiftCore.dll
+    # while its in-process plugins were built against the previous one, and class
+    # metadata initialisation aborts with a garbage InstanceSize.
+    $ToolTargets = @(
       "swift-frontend",
       "sourcekitd-test",
       "swift-ide-test",
       "swift-plugin-server"
     )
+    Write-NinjaRebuildReasons $BuildCMakeArgs.Bin $ToolTargets "phase 1: compiler tools"
+    Build-CMakeProject @BuildCMakeArgs -BuildTargets $ToolTargets
 
     # Prefer the platform SDK runtime.  The pre-staged bundle fallback keeps
     # running without -Toolchain usable when the install image is absent.
@@ -3285,50 +3446,40 @@ function Test-Compilers([Hashtable] $Platform, [string] $Variant, [switch] $Test
       throw "Test-Compilers: no Swift runtime DLLs found in any candidate ($($RuntimeSourceCandidates -join ', ')). The platform SDK runtime was not staged; build the toolchain/SDK (e.g. with -Toolchain) before running the test phase."
     }
 
-    Invoke-IsolatingEnvVars {
-      # Test-time tools execute on the build host.
-      Invoke-VsDevShell $BuildPlatform
-      Set-WindowsSxSToolchainRuntime `
-        -BinaryDir              $Stage2BinDir `
-        -RuntimeSourceDir       $RuntimeSource `
-        -ProcessorArchitecture  $BuildPlatform.Architecture.VSName `
-        -Tools                  @(
-                                   "swift.exe",
-                                   "swiftc.exe",
-                                   "swift-driver.exe",
-                                   "swift-frontend.exe",
-                                   "swift-synthesize-interface.exe",
-                                   "sil-opt.exe",
-                                   "sourcekitd-test.exe",
-                                   "swift-ide-test.exe",
-                                   "swift-plugin-server.exe",
-                                   "swiftc-legacy-driver.exe",
-                                   "lldb.exe",
-                                   "repl_swift.exe"
-                                 )
-      # SxS only probes the EXE's own directory for the named assembly.
-      if (Test-Path (Join-Path $Stage2LibexecSwiftDir "swift-backtrace.exe")) {
-        Set-WindowsSxSToolchainRuntime `
-          -BinaryDir              $Stage2LibexecSwiftDir `
-          -RuntimeSourceDir       $RuntimeSource `
-          -ProcessorArchitecture  $BuildPlatform.Architecture.VSName `
-          -Tools                  @("swift-backtrace.exe")
-      } else {
-        Write-Warning "SxS bind: '$Stage2LibexecSwiftDir\swift-backtrace.exe' not present; skipping backtracer bind (Build-TestBacktrace did not run or failed)"
-      }
-    }
+    # Phase 2: bind before anything rewrites bin\.
+    Invoke-TestToolchainSxSBind $BuildPlatform $Stage2BinDir $Stage2LibexecSwiftDir `
+      $RuntimeSource "before swift-test-stdlib"
 
+    # Phase 3: the remaining test artifacts.
+    #
     # TODO(roman-bcny): Workaround for https://github.com/swiftlang/swift/issues/87970
     # Stdlib DLLs must be fully linked before swift-frontend compilations
     # that load them, otherwise the linker races with memory-mapped DLLs
     # causing LNK1104. Build swift-test-stdlib first to enforce ordering.
-    $Targets = @("swift-test-stdlib") + $Targets
-    Build-CMakeProject @BuildCMakeArgs -BuildTargets $Targets
+    $ArtifactTargets = @("swift-test-stdlib")
+    if ($TestLLDB -or $TestLLDBSwift) {
+      # lldb.exe and repl_swift.exe exist only in the LLDB test dependency graph,
+      # so they are still absent at the phase 2 bind.
+      $ArtifactTargets += @("lldb-test-depends")
+    }
+    Write-NinjaRebuildReasons $BuildCMakeArgs.Bin $ArtifactTargets "phase 3: test artifacts"
+    Invoke-CMakeBuildTargets $Platform $BuildCMakeArgs.Bin $ArtifactTargets
+
+    # Phase 4: re-bind now that lldb.exe and repl_swift.exe exist.
+    Invoke-TestToolchainSxSBind $BuildPlatform $Stage2BinDir $Stage2LibexecSwiftDir `
+      $RuntimeSource "after test artifacts"
+
+    # Phase 5: run the tests.
+    if ($Targets) {
+      Write-NinjaRebuildReasons $BuildCMakeArgs.Bin $Targets "phase 5: swift tests"
+      Invoke-CMakeBuildTargets $Platform $BuildCMakeArgs.Bin $Targets
+    }
 
     if ($LLDBTargets) {
       Invoke-IsolatingEnvVars {
         $env:SDKROOT = $SwiftSDK
-        Build-CMakeProject @BuildCMakeArgs -BuildTargets $LLDBTargets
+        Write-NinjaRebuildReasons $BuildCMakeArgs.Bin $LLDBTargets "phase 5: lldb tests"
+        Invoke-CMakeBuildTargets $Platform $BuildCMakeArgs.Bin $LLDBTargets
       }
     }
   }
