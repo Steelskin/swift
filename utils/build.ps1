@@ -1946,10 +1946,25 @@ $Compilers.Host = @{
 }
 
 $Assemblers = @{
+  MSVC = @{
+    Executable        = { param([Hashtable] $Platform)
+      if ($Platform.Architecture.VSName -eq "x86") { "ml.exe" } else { "ml64.exe" }
+    }
+    Dialect           = "ASM_MASM"
+    Flags             = { param([Hashtable] $Platform) @("/nologo", "/quiet") }
+    DebugFlags        = { param([string] $Format)
+      @()
+    }
+    AssumeFunctional  = $true
+  }
+
   Pinned = @{
-    Executable        = Join-Path -Path (Get-PinnedToolchainToolsDir) -ChildPath "clang-cl.exe"
+    Executable        = { param([Hashtable] $Platform)
+      Join-Path -Path (Get-PinnedToolchainToolsDir) -ChildPath "clang-cl.exe"
+    }
+    Dialect           = "ASM"
     DriverStyle       = [DriverStyle]::ClangCL
-    Flags             = @()
+    Flags             = { param([Hashtable] $Platform) @("--target=$($Platform.Triple)") }
     DebugFlags        = { param([string] $Format)
       if ($Format -eq "dwarf") { @("-clang:-gdwarf") } else { @("-clang:-gcodeview") }
     }
@@ -1957,15 +1972,20 @@ $Assemblers = @{
   }
 
   Stage1 = @{
-    Executable        = [IO.Path]::Combine((Get-ProjectToolchainBin $BuildPlatform Stage1Compilers), "clang-cl.exe")
+    Executable        = { param([Hashtable] $Platform)
+      [IO.Path]::Combine((Get-ProjectToolchainBin $BuildPlatform Stage1Compilers), "clang-cl.exe")
+    }
+    Dialect           = "ASM"
     DriverStyle       = [DriverStyle]::ClangCL
-    Flags             = @()
+    Flags             = { param([Hashtable] $Platform) @("--target=$($Platform.Triple)") }
     DebugFlags        = { param([string] $Format)
       if ($Format -eq "dwarf") { @("-clang:-gdwarf") } else { @("-clang:-gcodeview") }
     }
     AssumeFunctional  = $true
   }
 }
+
+$Assemblers.Host = if ($UseHostToolchain) { $Assemblers.MSVC } else { $Assemblers.Pinned }
 
 function Build-CMakeProject {
   [CmdletBinding(PositionalBinding = $false)]
@@ -1981,7 +2001,6 @@ function Build-CMakeProject {
     [Hashtable] $CCompiler = $null,
     [Hashtable] $CXXCompiler = $null,
     [Hashtable] $SwiftCompiler = $null,
-    [switch] $UseASMMASM = $false,
     [switch] $AddAndroidCMakeEnv = $false,
     [string] $SwiftSDK = $null,
     [hashtable] $Defines = @{}, # Values are either single strings or arrays of flags
@@ -2005,7 +2024,6 @@ function Build-CMakeProject {
     }
 
     $UseASM = $Assembler -ne $null
-    $UseASM_MASM = [bool]$UseASMMASM
     $UseC = $CCompiler -ne $null
     $UseCXX = $CXXCompiler -ne $null
     $UseSwift = $SwiftCompiler -ne $null
@@ -2053,29 +2071,33 @@ function Build-CMakeProject {
     switch ($Platform.OS) {
       Windows {
         if ($UseASM) {
-          Add-KeyValueIfNew $Defines CMAKE_ASM_COMPILER $Assembler.Executable
-          Add-KeyValueIfNew $Defines CMAKE_ASM_FLAGS @("--target=$($Platform.Triple)")
-          Add-KeyValueIfNew $Defines CMAKE_ASM_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL "/MD"
+          $ASMDialect = $Assembler.Dialect
 
-          if ($DebugInfo) {
-            # CMake's MSVC_DEBUG_INFORMATION_FORMAT support also applies to ASM
-            # targets, but clang-cl-as-ASM does not get a built-in mapping for
-            # the Embedded format. Provide the mapping before setting the global
-            # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT below.
-            Add-FlagsDefine $Defines CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_Embedded `
-              $(& $Assembler.DebugFlags $PlatformDebugFormat)
+          Add-KeyValueIfNew $Defines "CMAKE_${ASMDialect}_COMPILER" (& $Assembler.Executable $Platform)
+          Add-KeyValueIfNew $Defines "CMAKE_${ASMDialect}_FLAGS" (& $Assembler.Flags $Platform)
+
+          # CMake's assembler detection computes the MSVC-like frontend
+          # correctly but does not cache CMAKE_<ASMDialect>_SIMULATE_ID and
+          # CMAKE_<ASMDialect>_COMPILER_FRONTEND_VARIANT. On every re-configure,
+          # the assembler is reloaded from the saved compiler file with both
+          # fields empty, the Ninja generator then misidentifies it as GCC on
+          # Windows and rewrites the include path with forward slashes,
+          # resulting in a full rebuild.
+          Add-KeyValueIfNew $Defines "CMAKE_${ASMDialect}_SIMULATE_ID" MSVC
+          Add-KeyValueIfNew $Defines "CMAKE_${ASMDialect}_COMPILER_FRONTEND_VARIANT" MSVC
+
+          if ($ASMDialect -eq "ASM") {
+            Add-KeyValueIfNew $Defines CMAKE_ASM_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL "/MD"
+
+            if ($DebugInfo) {
+              # CMake's MSVC_DEBUG_INFORMATION_FORMAT support also applies to ASM
+              # targets, but clang-cl-as-ASM does not get a built-in mapping for
+              # the Embedded format. Provide the mapping before setting the global
+              # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT below. MASM has no equivalent.
+              Add-FlagsDefine $Defines CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_Embedded `
+                $(& $Assembler.DebugFlags $PlatformDebugFormat)
+            }
           }
-        }
-
-        if ($UseASM_MASM) {
-          $ASM_MASM = if ($Platform.Architecture.VSName -eq "x86") {
-            "ml.exe"
-          } else {
-            "ml64.exe"
-          }
-
-          Add-KeyValueIfNew $Defines CMAKE_ASM_MASM_COMPILER $ASM_MASM
-          Add-KeyValueIfNew $Defines CMAKE_ASM_MASM_FLAGS @("/nologo" ,"/quiet")
         }
 
         if ($UseC) {
@@ -2228,7 +2250,7 @@ function Build-CMakeProject {
           } elseif ($UseCXX) {
             $CXXCompiler.Executable
           } elseif ($UseASM) {
-            $Assembler.Executable
+            (& $Assembler.Executable $Platform)
           }
           $ld = Join-Path -Path (Split-Path $Executable) -ChildPath "ld.lld"
           if ($UseSwift) {
@@ -2353,16 +2375,21 @@ function Build-CMakeProject {
     Write-Host "$CMakeBin $cmakeGenerateArgs"
     Invoke-Program $CMakeBin @cmakeGenerateArgs
 
+    Write-BuildFingerprint -Bin $Bin -CMakeArgs $cmakeGenerateArgs
+
     # Build all requested targets
     foreach ($Target in $BuildTargets) {
       if ($Target -eq "default") {
+        Invoke-NinjaExplain -Bin $Bin -LogName "build-default.log"
         Invoke-Program $CMakeBin --build $Bin
       } else {
+        Invoke-NinjaExplain -Bin $Bin -LogName "build-$Target.log" -Target $Target
         Invoke-Program $CMakeBin --build $Bin --target $Target
       }
     }
 
     if ($BuildTargets.Length -eq 0 -and $InstallTo) {
+      Invoke-NinjaExplain -Bin $Bin -LogName "build-install.log" -Target "install"
       Invoke-Program $CMakeBin --build $Bin --target install
     }
   }
@@ -2371,6 +2398,165 @@ function Build-CMakeProject {
   Write-Host ""
 }
 
+# --- Build diagnostics -------------------------------------------------------
+# Captures a per-run fingerprint of each project's configure output, so that an
+# occasional "everything is dirty" run can be diffed against a good one after
+# the fact. Everything here is best-effort and must never fail a build.
+
+$script:DiagRunId = $null
+
+function Get-DiagRunRoot {
+  if (-not $script:DiagRunId) {
+    $script:DiagRunId = [DateTime]::Now.ToString("yyyyMMdd-HHmmss")
+  }
+  $Root = Join-Path $BinaryCache "_diag\$($script:DiagRunId)"
+  if (-not (Test-Path $Root)) {
+    New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    # The environment is per-run, not per-project.
+    Get-ChildItem Env: | Sort-Object Name |
+      ForEach-Object { "$($_.Name)=$($_.Value)" } |
+      Set-Content -Path (Join-Path $Root "environment.txt")
+  }
+  return $Root
+}
+
+# Snapshot what determines each compile command, so a bad run can be diffed
+# against a good one. Deliberately avoids copying build.ninja (too large): the
+# hash plus the extracted command-determining lines is enough.
+# Which separator style a set of ninja variable lines uses. Include paths and
+# link paths are emitted by different code paths in the Ninja generator; if they
+# disagree, the generator has misdetected the toolchain (see the ASM note above)
+# and every include-bearing command has churned.
+function Get-SeparatorStyle($Lines, [string] $Prefix) {
+  $Vals = @($Lines | Where-Object { $_ -match ("^" + $Prefix + "\s*=") } | ForEach-Object { ($_ -split "=", 2)[1] })
+  $Bs = @($Vals | Where-Object { $_ -match "[A-Za-z]:\\" }).Count
+  $Fs = @($Vals | Where-Object { $_ -match "[A-Za-z]:/" }).Count
+  if ($Bs -gt 0 -and $Fs -gt 0) { return "mixed" }
+  if ($Bs -gt 0) { return "backslash" }
+  if ($Fs -gt 0) { return "forwardslash" }
+  return "n/a"
+}
+function Write-BuildFingerprint([string] $Bin, [string[]] $CMakeArgs) {
+  try {
+    $Root = Get-DiagRunRoot
+    $Tag = Split-Path $Bin -Leaf
+    $Dir = Join-Path $Root $Tag
+    New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+
+    $Ninja = Join-Path $Bin "build.ninja"
+    $Cache = Join-Path $Bin "CMakeCache.txt"
+    $NinjaHash = if (Test-Path $Ninja) { (Get-FileHash $Ninja -Algorithm SHA256).Hash } else { "" }
+    $CacheHash = if (Test-Path $Cache) { (Get-FileHash $Cache -Algorithm SHA256).Hash } else { "" }
+    if (Test-Path $Cache) { Copy-Item $Cache (Join-Path $Dir "CMakeCache.txt") -Force }
+    ($CMakeArgs -join " ") | Set-Content -Path (Join-Path $Dir "cmake-argv.txt")
+
+    $FlagsHash = ""
+    $SortedHash = ""
+    $RulesHash = ""
+    $IncSep = "n/a"
+    $LinkSep = "n/a"
+    if (Test-Path $Ninja) {
+      $FlagLines = Select-String -Path $Ninja -Pattern '^\s+(FLAGS|DEFINES|INCLUDES|LINK_FLAGS|SWIFT_MODULE)\s*=' |
+        ForEach-Object { $_.Line.Trim() } | Sort-Object -Unique
+      $FlagsFile = Join-Path $Dir "flags.txt"
+      $FlagLines | Set-Content -Path $FlagsFile
+      $FlagsHash = (Get-FileHash $FlagsFile -Algorithm SHA256).Hash
+
+      # Token-sorted view. If SortedHash matches across two runs but FlagsHash
+      # does not, the difference is pure ORDERING, which points at
+      # nondeterministic flag assembly (e.g. hashtable enumeration order)
+      # rather than at a genuinely different flag.
+      $SortedFile = Join-Path $Dir "flags-sorted-tokens.txt"
+      $FlagLines | ForEach-Object {
+        $Kv = $_ -split "=", 2
+        $Toks = (($Kv[1].Trim() -split '\s+' | Where-Object { $_ } | Sort-Object) -join " ")
+        "$($Kv[0].Trim())= $Toks"
+      } | Sort-Object -Unique | Set-Content -Path $SortedFile
+      $SortedHash = (Get-FileHash $SortedFile -Algorithm SHA256).Hash
+
+      # The rule bodies themselves: a generator-level formatting change shows up
+      # here even when every flag value is unchanged.
+      $RuleLines = Select-String -Path $Ninja -Pattern '^(rule\s+\S+|\s+(command|depfile|deps|rspfile|rspfile_content)\s*=)' |
+        ForEach-Object { $_.Line.TrimEnd() }
+      $RulesFile = Join-Path $Dir "rules.txt"
+      $RuleLines | Set-Content -Path $RulesFile
+      $RulesHash = (Get-FileHash $RulesFile -Algorithm SHA256).Hash
+
+      $IncSep = Get-SeparatorStyle $FlagLines "INCLUDES"
+      $LinkSep = Get-SeparatorStyle $FlagLines "LINK_FLAGS"
+    }
+
+    $Short = { param($h) if ($h) { $h.Substring(0, [Math]::Min(16, $h.Length)) } else { "" } }
+    [PSCustomObject]@{
+      Timestamp  = [DateTime]::Now.ToString("yyyy-MM-dd HH:mm:ss")
+      Project    = $Tag
+      NinjaHash  = (& $Short $NinjaHash)
+      CacheHash  = (& $Short $CacheHash)
+      FlagsHash  = (& $Short $FlagsHash)
+      SortedHash = (& $Short $SortedHash)
+      RulesHash  = (& $Short $RulesHash)
+      IncludeSep = $IncSep
+      LinkSep    = $LinkSep
+    } | Export-Csv -Path (Join-Path $Root "fingerprints.csv") -NoTypeInformation -Append
+
+    # Include and link paths disagreeing means the Ninja generator rewrote one
+    # and not the other - the exact signature of the ASM misdetection.
+    if ($IncSep -ne "n/a" -and $LinkSep -ne "n/a" -and $IncSep -ne $LinkSep) {
+      Write-Host -ForegroundColor Red "diagnostics: ${Tag}: include/link separator MISMATCH (INCLUDES=$IncSep LINK_FLAGS=$LinkSep) - toolchain misdetection, expect a full rebuild"
+    }
+  } catch {
+    Write-Host -ForegroundColor Yellow "diagnostics: fingerprint failed for '$Bin': $_"
+  }
+}
+
+# Classify why ninja intends to do work. The three buckets point at completely
+# different root causes:
+#   Missing    - a declared output that is never produced (permanently dirty)
+#   NewerInput - mtime churn from an upstream product
+#   CmdLine    - the compile command itself differs between configures
+function Write-ExplainSummary([string] $Bin, [string] $Log) {
+  try {
+    if (-not (Test-Path $Log)) { return }
+    $Root = Get-DiagRunRoot
+    $Lines = [IO.File]::ReadAllLines($Log)
+    $Tag = Split-Path $Bin -Leaf
+    $Edges   = @($Lines | Where-Object { $_ -match '^\[\d+/\d+\]' }).Count
+    $Missing = @($Lines | Where-Object { $_ -match "doesn't exist" }).Count
+    $Newer   = @($Lines | Where-Object { $_ -match 'older than most recent input' }).Count
+    $CmdLine = @($Lines | Where-Object { $_ -match 'command line changed' }).Count
+    $BadLog  = @($Lines | Where-Object { $_ -match 'unknown target' }).Count
+    [PSCustomObject]@{
+      Timestamp  = [DateTime]::Now.ToString("yyyy-MM-dd HH:mm:ss")
+      Project    = $Tag
+      Log        = Split-Path $Log -Leaf
+      Edges      = $Edges
+      Missing    = $Missing
+      NewerInput = $Newer
+      CmdLine    = $CmdLine
+      BadLog     = $BadLog
+    } | Export-Csv -Path (Join-Path $Root "explain-summary.csv") -NoTypeInformation -Append
+
+    # A full-project rebuild driven by changed commands is the intermittent
+    # failure mode we are hunting; make it loud rather than 39,000 lines deep.
+    if ($CmdLine -gt 0) {
+      Write-Host -ForegroundColor Yellow "diagnostics: ${Tag}: $CmdLine edge(s) dirty due to 'command line changed'"
+    }
+  } catch {
+    Write-Host -ForegroundColor Yellow "diagnostics: explain summary failed for '$Log': $_"
+  }
+}
+
+function Invoke-NinjaExplain([string] $Bin, [string] $LogName, [string] $Target = "") {
+  $Log = Join-Path $Bin $LogName
+  try {
+    if ($Target) {
+      ninja -C $Bin -n -d explain $Target > $Log 2>&1
+    } else {
+      ninja -C $Bin -n -d explain > $Log 2>&1
+    }
+  } catch { }
+  Write-ExplainSummary -Bin $Bin -Log $Log
+}
 enum SPMBuildAction {
   # 'swift build'
   Build
@@ -2566,8 +2752,7 @@ function Build-BuildTools([Hashtable] $Platform) {
     -Src $SourceCache\llvm-project\llvm `
     -Bin (Get-ProjectBinaryCache $Platform BuildTools) `
     -Platform $Platform `
-    -Assembler $(if ($UseHostToolchain) { $null } else { $Assemblers.Pinned }) `
-    -UseASMMASM:$UseHostToolchain `
+    -Assembler $Assemblers.Host `
     -CCompiler $Compilers.Host.C `
     -CXXCompiler $Compilers.Host.CXX `
     -BuildTargets llvm-tblgen,clang-tblgen,clang-tidy-confusable-chars-gen,lldb-tblgen,llvm-config,swift-def-to-strings-converter,swift-serialize-diagnostics,swift-compatibility-symbols `
@@ -2800,6 +2985,7 @@ function Get-CompilersDefines([Hashtable] $Platform,
 function Build-Compilers([Hashtable] $Platform,
                          [string]    $Variant,
                          [Project]   $Project          = [Project]::Compilers,
+                         [Hashtable] $Assembler        = $Assemblers.Host,
                          [Hashtable] $CCompiler        = $Compilers.Host.C,
                          [Hashtable] $CXXCompiler      = $Compilers.Host.CXX,
                          [Hashtable] $SwiftCompiler    = $Compilers.Pinned.Swift,
@@ -2815,6 +3001,7 @@ function Build-Compilers([Hashtable] $Platform,
     -Bin (Get-ProjectBinaryCache $Platform $Project) `
     -InstallTo "$ToolchainRoot\usr" `
     -Platform $Platform `
+    -Assembler $Assembler `
     -CCompiler $CCompiler `
     -CXXCompiler $CXXCompiler `
     -SwiftCompiler $SwiftCompiler `
@@ -4001,6 +4188,12 @@ function Install-SDK([Hashtable[]] $Platforms, [OS] $OS = $Platforms[0].OS, [str
     foreach ($ResourceType in ("swift", "swift_static")) {
       $PlatformResources = "$(Get-SwiftSDK -OS $OS -Identifier $Identifier)\usr\lib\$ResourceType\$($OS.ToString().ToLowerInvariant())"
       Get-ChildItem -ErrorAction SilentlyContinue -Recurse "$PlatformResources\$($Platform.Architecture.LLVMName)" | ForEach-Object {
+        # A thick module layout (CMP0195) is already correct; relocate it intact.
+        if ($_.PSIsContainer) { return }
+        if ($_.Directory.Name.EndsWith(".swiftmodule")) {
+          Copy-File $_.FullName "$PlatformResources\$($_.Directory.Name)\$($_.Name)"
+          return
+        }
         if (".swiftmodule", ".swiftdoc", ".swiftinterface" -contains $_.Extension) {
           Write-Host -BackgroundColor DarkRed -ForegroundColor White "$($_.FullName) is not in a thick module layout"
           Copy-File $_.FullName "$PlatformResources\$($_.BaseName).swiftmodule\$(Get-ModuleTriple $Platform)$($_.Extension)"
@@ -5629,6 +5822,7 @@ if ($Toolchain) {
   Invoke-BuildStep Build-XML2 $BuildPlatform -CCompiler $Compilers.Host.C -CXXCompiler $Compilers.Host.CXX -Phase "Bootstrap"
   Invoke-BuildStep Build-Compilers $BuildPlatform -Variant "Asserts" -Project Stage1Compilers @{
     CacheScript     = "$SourceCache\swift\cmake\caches\Windows-Bootstrap-Stage1-$($BuildPlatform.Architecture.LLVMName).cmake";
+    Assembler       = $Assemblers.Host;
     CCompiler       = $Compilers.Host.C;
     CXXCompiler     = $Compilers.Host.CXX;
     SwiftCompiler   = $Compilers.Pinned.Swift;
@@ -5662,6 +5856,7 @@ if ($Toolchain) {
   Invoke-BuildStep Build-CMark $HostPlatform
   Invoke-BuildStep Build-XML2 $HostPlatform -CCompiler $Compilers.Stage1.C -CXXCompiler $Compilers.Stage1.CXX -Phase "Compiler"
   Invoke-BuildStep Build-Compilers $HostPlatform -Variant "Asserts" -Project Stage2Compilers @{
+    Assembler       = $Assemblers.Stage1;
     CCompiler       = $Compilers.Stage1.C;
     CXXCompiler     = $Compilers.Stage1.CXX;
     SwiftCompiler   = $Compilers.Stage1.Swift;
@@ -5782,6 +5977,7 @@ if ($Toolchain) {
   # ── Stage2 NoAsserts Compiler ─────────────────────────────────────────────
   if ($IncludeNoAsserts) {
     Invoke-BuildStep Build-Compilers $HostPlatform -Variant "NoAsserts" -Project Stage2Compilers @{
+      Assembler       = $Assemblers.Stage1;
       CCompiler       = $Compilers.Stage1.C;
       CXXCompiler     = $Compilers.Stage1.CXX;
       SwiftCompiler   = $Compilers.Stage1.Swift;

@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.19.6)
 
+if(POLICY CMP0157)
+  cmake_policy(SET CMP0157 NEW)
+endif()
+if(POLICY CMP0195)
+  cmake_policy(SET CMP0195 NEW)
+endif()
+
 
 #  set_property(GLOBAL PROPERTY GLOBAL_DEPENDS_DEBUG_MODE 1)
 

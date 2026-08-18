@@ -25,8 +25,19 @@ function(emit_swift_interface target)
     message(STATUS "Removing regular file '${module_directory}' to support nested swiftmodule generation")
     file(REMOVE ${module_directory})
   endif()
-  target_compile_options(${target} PRIVATE
-    "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-emit-module-path ${module_directory}/${SwiftOverlay_MODULE_TRIPLE}.swiftmodule>")
+  set(_cmp0195_status "OLD")
+  if(POLICY CMP0195)
+    cmake_policy(GET CMP0195 _cmp0195_status)
+  endif()
+  if(_cmp0195_status STREQUAL "NEW")
+    # Under CMP0195 CMake emits <module>.swiftmodule/<triple>.swiftmodule
+    # itself. Pin the module directory so it matches the layout used below.
+    set_target_properties(${target} PROPERTIES
+      Swift_MODULE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  else()
+    target_compile_options(${target} PRIVATE
+      "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-emit-module-path ${module_directory}/${SwiftOverlay_MODULE_TRIPLE}.swiftmodule>")
+  endif()
   set_property(TARGET "${target}" APPEND PROPERTY ADDITIONAL_CLEAN_FILES
     "${module_directory}/${SwiftOverlay_MODULE_TRIPLE}.swiftmodule"
     "${module_directory}/${SwiftOverlay_MODULE_TRIPLE}.swiftdoc"
